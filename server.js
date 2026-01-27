@@ -2,212 +2,202 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const axios = require('axios');
 const { RouterOSAPI } = require('node-routeros');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 
-/* ==================== CONFIG MIKROTIK ==================== */
-const connection = new RouterOSAPI({
+/* =========================================================
+   CONFIG MIKROTIK
+========================================================= */
+const mikrotik = new RouterOSAPI({
   host: process.env.MIKROTIK_HOST,
   user: process.env.MIKROTIK_USER,
   password: process.env.MIKROTIK_PASSWORD,
   timeout: Number(process.env.MIKROTIK_TIMEOUT || 10000)
 });
 
-// Retry MikroTik toutes les 5s si offline
-connection.on('error', async (err) => {
-  console.error('⚠️ MikroTik error:', err.message || err);
-
-  if (!connection.connected) {
-    console.log('ℹ️ Tentative de reconnexion MikroTik dans 5s...');
-    setTimeout(async () => {
-      try {
-        await connection.connect();
-        console.log('✅ Reconnecté au MikroTik');
-      } catch (e) {
-        console.error('❌ Reconnexion échouée:', e.message);
-      }
-    }, 5000);
-  }
-});
-
 async function connectMikrotik() {
-  try {
-    await connection.connect();
+  if (!mikrotik.connected) {
+    await mikrotik.connect();
     console.log('✅ Connecté au MikroTik');
-  } catch (err) {
-    console.error('❌ MikroTik indisponible au démarrage');
   }
 }
-connectMikrotik();
 
-/* ==================== VOUCHER ==================== */
+/* =========================================================
+   GÉNÉRATION VOUCHER
+========================================================= */
 async function generateVoucher(profileName) {
   const username = 'SD-' + Math.random().toString(36).substring(2, 7);
   const password = Math.random().toString(36).slice(-6);
 
-  try {
-    if (!connection.connected) {
-      console.log('ℹ️ Reconnexion MikroTik avant création voucher...');
-      await connection.connect();
-    }
+  await connectMikrotik();
 
-    await connection.write('/ip/hotspot/user/add', [
-      `=name=${username}`,
-      `=password=${password}`,
-      `=profile=${profileName}`
-    ]);
+  await mikrotik.write('/ip/hotspot/user/add', [
+    `=name=${username}`,
+    `=password=${password}`,
+    `=profile=${profileName}`
+  ]);
 
-    console.log(`✅ Voucher créé: ${username} / ${password}`);
-    return { username, password };
-  } catch (err) {
-    console.error('❌ Erreur création voucher:', err.message || err);
-    throw new Error('MikroTik indisponible');
-  }
+  console.log(`🎟️ Voucher créé: ${username}/${password}`);
+  return { username, password };
 }
 
-/* ==================== MVOLA ==================== */
-const IS_SANDBOX = process.env.IS_SANDBOX === 'true';
+/* =========================================================
+   UTILS
+========================================================= */
+function normalizePhone(phone) {
+  return phone.replace(/\D/g, '').slice(-9);
+}
 
-const CONFIG = {
-  sandbox: {
-    TOKEN: process.env.MVOLA_SANDBOX_TOKEN,
-    PAYMENT: process.env.MVOLA_SANDBOX_PAYMENT,
-    MERCHANT: process.env.MVOLA_SANDBOX_MERCHANT,
-    CLIENT_ID: process.env.MVOLA_SANDBOX_CLIENT_ID,
-    CLIENT_SECRET: process.env.MVOLA_SANDBOX_CLIENT_SECRET
-  },
-  prod: {
-    TOKEN: process.env.MVOLA_PROD_TOKEN,
-    PAYMENT: process.env.MVOLA_PROD_PAYMENT,
-    MERCHANT: process.env.MVOLA_PROD_MERCHANT,
-    CLIENT_ID: process.env.MVOLA_PROD_CLIENT_ID,
-    CLIENT_SECRET: process.env.MVOLA_PROD_CLIENT_SECRET
+function generateRef() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+/* =========================================================
+   STOCKAGE TEMPORAIRE
+========================================================= */
+const pendingPayments = {}; // sessionId -> paiement pending
+const vouchers = {};        // sessionId -> voucher
+
+/* =========================================================
+   INIT USSD
+========================================================= */
+app.post('/ussd/init', (req, res) => {
+  const { phone, amount, offer } = req.body;
+  if (!phone || !amount || !offer) {
+    return res.status(400).json({ error: 'Paramètres manquants' });
   }
-};
 
-const CURRENT = IS_SANDBOX ? CONFIG.sandbox : CONFIG.prod;
+  const sessionId = uuidv4();
+  const ref = generateRef();
 
-let accessToken = null;
-let tokenExpiresAt = 0;
+  pendingPayments[sessionId] = {
+    phone: normalizePhone(phone),
+    amount: Number(amount),
+    offer,
+    ref,
+    status: 'PENDING',
+    createdAt: Date.now()
+  };
 
-async function getMvToken() {
-  const now = Date.now();
-  if (accessToken && now < tokenExpiresAt) return accessToken;
+  console.log('🟡 USSD INIT:', { sessionId, ...pendingPayments[sessionId] });
 
-  try {
-    const basicAuth = Buffer.from(
-      `${CURRENT.CLIENT_ID}:${CURRENT.CLIENT_SECRET}`
-    ).toString('base64');
+  res.json({
+    success: true,
+    sessionId,
+    ref
+  });
+});
 
-    const resp = await axios.post(
-      CURRENT.TOKEN,
-      'grant_type=client_credentials&scope=EXT_INT_MVOLA_SCOPE',
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${basicAuth}`
-        }
-      }
+/* =========================================================
+   SMS ENTRANT (SEULEMENT MVOLA)
+========================================================= */
+app.post('/sms/incoming', async (req, res) => {
+  const { sender, message } = req.body;
+
+  if (!message || !sender) return res.sendStatus(200);
+  if (!/mvola/i.test(sender)) return res.sendStatus(200);
+
+  console.log('📩 SMS MVola reçu:', message);
+
+  // Extraction montant depuis le message (avec ou sans espace)
+  const amountMatch = message.match(/(\d{1,3}(?:[ ,]\d{3})*|\d+)\s?Ar/i);
+  if (!amountMatch) return res.sendStatus(200);
+  const amount = Number(amountMatch[1].replace(/[ ,\.]/g, ''));
+
+  // Extraction du numéro téléphone
+  const phoneMatch = message.match(/\((0\d{9,10})\)/);
+  if (!phoneMatch) return res.sendStatus(200);
+
+  const smsPhone = normalizePhone(phoneMatch[1]);
+
+
+  // Matching sur pendingPayments par montant seulement
+  const sessionId = Object.keys(pendingPayments).find(id => {
+    const p = pendingPayments[id];
+    // return p.status === 'PENDING' && p.amount === amount;
+    return (
+      p.status === 'PENDING' &&
+      p.amount === amount &&
+      p.phone === smsPhone
     );
+  });
 
-    accessToken = resp.data.access_token;
-    tokenExpiresAt = now + resp.data.expires_in * 1000 - 5000;
-    console.log('✅ Nouveau token MVola obtenu');
-    return accessToken;
-  } catch (err) {
-    console.error('❌ Impossible d’obtenir le token MVola', err.response?.data || err.message);
-    throw err;
+  if (!sessionId) {
+    console.log('❌ Aucun paiement correspondant pour ce montant');
+    return res.sendStatus(200);
   }
-}
 
-/* ==================== ROUTES ==================== */
+  const payment = pendingPayments[sessionId];
+  payment.status = 'CONFIRMED';
+  console.log('✅ Paiement validé:', payment);
 
-// Génération directe (sans paiement)
-app.post('/voucher', async (req, res) => {
-  const { offer } = req.body;
-  const map = { '1h': '1Heure', '5h': '5Heures', '24h': '24Heures' };
-  const profile = map[offer];
-
-  if (!profile) return res.status(400).json({ error: 'Offre invalide' });
+  // Création voucher
+  const profileMap = { '1h':'1Heure','5h':'5Heures','24h':'24Heures' };
+  const profile = profileMap[payment.offer];
+  if (!profile) return res.sendStatus(200);
 
   try {
     const voucher = await generateVoucher(profile);
-    res.json({ success: true, voucher });
-  } catch (e) {
-    res.status(503).json({ error: 'MikroTik hors ligne' });
-  }
-});
-
-// Init paiement
-app.post('/pay', async (req, res) => {
-  const { amount, phone, offer } = req.body;
-  if (!amount || !phone || !offer)
-    return res.status(400).json({ error: 'Paramètres manquants' });
-
-  const correlationId = uuidv4();
-
-  try {
-    const token = await getMvToken();
-
-    const payload = {
-      amount: amount.toString(),
-      currency: 'Ar',
-      descriptionText: `Paiement Wifi ${offer}`,
-      requestingOrganisationTransactionReference: correlationId,
-      sendingOrganisationTransactionReference: correlationId,
-      requestDate: new Date().toISOString(),
-      transactionChannel: 'MERCHANT',
-      debitParty: [{ key: 'msisdn', value: phone }],
-      creditParty: [{ key: 'msisdn', value: CURRENT.MERCHANT }]
-    };
-
-    await axios.post(CURRENT.PAYMENT, payload, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-CorrelationID': correlationId,
-        UserLanguage: 'fr',
-        UserAccountIdentifier: `msisdn:${CURRENT.MERCHANT}`,
-        partnerName: 'Wifi-Hotspot',
-        'Content-Type': 'application/json'
-      }
-    });
-
-    res.json({ success: true, correlationId });
+    vouchers[sessionId] = voucher; // stock pour polling
+    console.log('🎉 Voucher créé:', voucher);
   } catch (err) {
-    console.error('❌ Erreur MVola:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Erreur MVola' });
+    console.error('❌ Erreur MikroTik:', err.message);
+  } finally {
+    delete pendingPayments[sessionId]; // on supprime le pending
+  }
+
+  res.sendStatus(200);
+});
+
+/* =========================================================
+   ENDPOINT POUR POLLING VOUCHER
+========================================================= */
+app.get('/voucher/status/:sessionId', (req,res)=>{
+  const { sessionId } = req.params;
+
+  if(vouchers[sessionId]){
+    const voucher = vouchers[sessionId];
+    // On renvoie mais on garde en mémoire pour bouton "Afficher mes vouchers"
+    return res.json({ success:true, voucher });
+  } else {
+    return res.json({ success:false });
   }
 });
 
-// Vérification paiement
-app.get('/pay/status/:id/:offer', async (req, res) => {
-  const { id, offer } = req.params;
-  const map = { '1h': '1Heure', '5h': '5Heures', '24h': '24Heures' };
-  const profile = map[offer];
+/* =========================================================
+   ENDPOINT POUR RECUPERER TOUS LES VOUCHERS D'UNE SESSION
+========================================================= */
+app.get('/voucher/all/:sessionId', (req,res)=>{
+  const { sessionId } = req.params;
+  if(vouchers[sessionId]){
+    return res.json({ success:true, voucher:vouchers[sessionId] });
+  } else {
+    return res.json({ success:false });
+  }
+});
 
-  try {
-    const token = await getMvToken();
-    const statusRes = await axios.get(`${CURRENT.PAYMENT}/status/${id}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-
-    if (statusRes.data.status === 'SUCCESS') {
-      const voucher = await generateVoucher(profile);
-      return res.json({ success: true, voucher });
+/* =========================================================
+   EXPIRATION AUTOMATIQUE
+========================================================= */
+setInterval(() => {
+  const now = Date.now();
+  for (const id in pendingPayments) {
+    if (now - pendingPayments[id].createdAt > 7 * 60 * 1000) {
+      console.log('🧹 Session expirée:', pendingPayments[id].ref);
+      delete pendingPayments[id];
     }
-
-    res.json({ success: false, status: statusRes.data.status });
-  } catch (err) {
-    console.error('❌ Erreur statut paiement:', err.message || err);
-    res.status(500).json({ error: 'Erreur statut paiement' });
   }
-});
+}, 60 * 1000);
 
-/* ==================== SERVER ==================== */
+/* =========================================================
+   SERVER
+========================================================= */
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Backend USSD + SMS sécurisé sur le port ${PORT}`);
+});
+  

@@ -10,30 +10,53 @@ app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 
 /* =========================================================
-   CONFIG MIKROTIK
+   CONFIG MIKROTIK (SAFE)
 ========================================================= */
 const mikrotik = new RouterOSAPI({
   host: process.env.MIKROTIK_HOST,
   user: process.env.MIKROTIK_USER,
   password: process.env.MIKROTIK_PASSWORD,
-  timeout: Number(process.env.MIKROTIK_TIMEOUT || 10000)
+  timeout: Number(process.env.MIKROTIK_TIMEOUT || 5000)
 });
 
+let mikrotikReady = false;
+let reconnecting = false;
+
 async function connectMikrotik() {
-  if (!mikrotik.connected) {
+  if (mikrotikReady || reconnecting) return;
+
+  try {
+    reconnecting = true;
     await mikrotik.connect();
+    mikrotikReady = true;
     console.log('✅ Connecté au MikroTik');
+  } catch (err) {
+    console.error('❌ MikroTik indisponible:', err.message);
+  } finally {
+    reconnecting = false;
   }
 }
 
+mikrotik.on('error', (err) => {
+  mikrotikReady = false;
+  console.error('⚠️ MikroTik error:', err?.message || err);
+
+  if (reconnecting) return;
+
+  console.log('ℹ️ Reconnexion MikroTik dans 5s...');
+  setTimeout(connectMikrotik, 5000);
+});
+
 /* =========================================================
-   GÉNÉRATION VOUCHER
+   GÉNÉRATION VOUCHER (SAFE)
 ========================================================= */
 async function generateVoucher(profileName) {
+  if (!mikrotikReady) {
+    throw new Error('MikroTik non disponible');
+  }
+
   const username = 'SD-' + Math.random().toString(36).substring(2, 7);
   const password = Math.random().toString(36).slice(-6);
-
-  await connectMikrotik();
 
   await mikrotik.write('/ip/hotspot/user/add', [
     `=name=${username}`,
@@ -57,9 +80,9 @@ function generateRef() {
 }
 
 /* =========================================================
-   STOCKAGE TEMPORAIRE
+   STOCKAGE TEMPORAIRE (RAM)
 ========================================================= */
-const pendingPayments = {}; // sessionId -> paiement pending
+const pendingPayments = {}; // sessionId -> paiement
 const vouchers = {};        // sessionId -> voucher
 
 /* =========================================================
@@ -85,40 +108,30 @@ app.post('/ussd/init', (req, res) => {
 
   console.log('🟡 USSD INIT:', { sessionId, ...pendingPayments[sessionId] });
 
-  res.json({
-    success: true,
-    sessionId,
-    ref
-  });
+  res.json({ success: true, sessionId, ref });
 });
 
 /* =========================================================
-   SMS ENTRANT (SEULEMENT MVOLA)
+   SMS ENTRANT (MVOLA)
 ========================================================= */
 app.post('/sms/incoming', async (req, res) => {
   const { sender, message } = req.body;
 
-  if (!message || !sender) return res.sendStatus(200);
+  if (!sender || !message) return res.sendStatus(200);
   if (!/mvola/i.test(sender)) return res.sendStatus(200);
 
   console.log('📩 SMS MVola reçu:', message);
 
-  // Extraction montant depuis le message (avec ou sans espace)
   const amountMatch = message.match(/(\d{1,3}(?:[ ,]\d{3})*|\d+)\s?Ar/i);
   if (!amountMatch) return res.sendStatus(200);
   const amount = Number(amountMatch[1].replace(/[ ,\.]/g, ''));
 
-  // Extraction du numéro téléphone
   const phoneMatch = message.match(/\((0\d{9,10})\)/);
   if (!phoneMatch) return res.sendStatus(200);
-
   const smsPhone = normalizePhone(phoneMatch[1]);
 
-
-  // Matching sur pendingPayments par montant seulement
   const sessionId = Object.keys(pendingPayments).find(id => {
     const p = pendingPayments[id];
-    // return p.status === 'PENDING' && p.amount === amount;
     return (
       p.status === 'PENDING' &&
       p.amount === amount &&
@@ -127,57 +140,52 @@ app.post('/sms/incoming', async (req, res) => {
   });
 
   if (!sessionId) {
-    console.log('❌ Aucun paiement correspondant pour ce montant');
+    console.log('❌ Aucun paiement correspondant');
     return res.sendStatus(200);
   }
 
   const payment = pendingPayments[sessionId];
   payment.status = 'CONFIRMED';
-  console.log('✅ Paiement validé:', payment);
+  console.log('✅ Paiement confirmé:', payment);
 
-  // Création voucher
-  const profileMap = { '1h':'1Heure','5h':'5Heures','24h':'24Heures' };
+  const profileMap = {
+    '1h': '1Heure',
+    '5h': '5Heures',
+    '24h': '24Heures'
+  };
   const profile = profileMap[payment.offer];
   if (!profile) return res.sendStatus(200);
 
   try {
     const voucher = await generateVoucher(profile);
-    vouchers[sessionId] = voucher; // stock pour polling
-    console.log('🎉 Voucher créé:', voucher);
+    vouchers[sessionId] = voucher;
+    console.log('🎉 Voucher prêt:', voucher);
   } catch (err) {
-    console.error('❌ Erreur MikroTik:', err.message);
+    console.error('❌ Voucher non créé:', err.message);
   } finally {
-    delete pendingPayments[sessionId]; // on supprime le pending
+    delete pendingPayments[sessionId];
   }
 
   res.sendStatus(200);
 });
 
 /* =========================================================
-   ENDPOINT POUR POLLING VOUCHER
+   POLLING VOUCHER
 ========================================================= */
-app.get('/voucher/status/:sessionId', (req,res)=>{
-  const { sessionId } = req.params;
-
-  if(vouchers[sessionId]){
-    const voucher = vouchers[sessionId];
-    // On renvoie mais on garde en mémoire pour bouton "Afficher mes vouchers"
-    return res.json({ success:true, voucher });
-  } else {
-    return res.json({ success:false });
+app.get('/voucher/status/:sessionId', (req, res) => {
+  const voucher = vouchers[req.params.sessionId];
+  if (voucher) {
+    return res.json({ success: true, voucher });
   }
+  res.json({ success: false });
 });
 
-/* =========================================================
-   ENDPOINT POUR RECUPERER TOUS LES VOUCHERS D'UNE SESSION
-========================================================= */
-app.get('/voucher/all/:sessionId', (req,res)=>{
-  const { sessionId } = req.params;
-  if(vouchers[sessionId]){
-    return res.json({ success:true, voucher:vouchers[sessionId] });
-  } else {
-    return res.json({ success:false });
+app.get('/voucher/all/:sessionId', (req, res) => {
+  const voucher = vouchers[req.params.sessionId];
+  if (voucher) {
+    return res.json({ success: true, voucher });
   }
+  res.json({ success: false });
 });
 
 /* =========================================================
@@ -198,6 +206,6 @@ setInterval(() => {
 ========================================================= */
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`🚀 Backend USSD + SMS sécurisé sur le port ${PORT}`);
+  console.log(`🚀 Backend USSD + SMS prêt sur le port ${PORT}`);
+  connectMikrotik();
 });
-  

@@ -16,49 +16,33 @@ const mikrotik = new RouterOSAPI({
   host: process.env.MIKROTIK_HOST,
   user: process.env.MIKROTIK_USER,
   password: process.env.MIKROTIK_PASSWORD,
-  timeout: Number(process.env.MIKROTIK_TIMEOUT || 10000)
+  timeout: Number(process.env.MIKROTIK_TIMEOUT || 5000)
 });
 
 let mikrotikReady = false;
 let reconnecting = false;
 
-function safeDisconnect() {
-  try {
-    mikrotikReady = false;
-    mikrotik.close?.();
-  } catch (_) {}
-}
-
 async function connectMikrotik() {
   if (mikrotikReady || reconnecting) return;
 
-  reconnecting = true;
   try {
+    reconnecting = true;
     await mikrotik.connect();
     mikrotikReady = true;
     console.log('✅ Connecté au MikroTik');
   } catch (err) {
-    mikrotikReady = false;
     console.error('❌ MikroTik indisponible:', err.message);
   } finally {
     reconnecting = false;
   }
 }
 
-async function ensureMikrotik() {
-  if (!mikrotikReady) {
-    await connectMikrotik();
-  }
-  if (!mikrotikReady) {
-    throw new Error('MikroTik non disponible');
-  }
-}
-
 mikrotik.on('error', (err) => {
+  mikrotikReady = false;
   console.error('⚠️ MikroTik error:', err?.message || err);
-  safeDisconnect();
 
   if (reconnecting) return;
+
   console.log('ℹ️ Reconnexion MikroTik dans 5s...');
   setTimeout(connectMikrotik, 5000);
 });
@@ -67,29 +51,18 @@ mikrotik.on('error', (err) => {
    GÉNÉRATION VOUCHER (SAFE)
 ========================================================= */
 async function generateVoucher(profileName) {
-  await ensureMikrotik();
+  if (!mikrotikReady) {
+    throw new Error('MikroTik non disponible');
+  }
 
   const username = 'SD-' + Math.random().toString(36).substring(2, 7);
   const password = Math.random().toString(36).slice(-6);
 
-  try {
-    await mikrotik.write('/ip/hotspot/user/add', [
-      `=name=${username}`,
-      `=password=${password}`,
-      `=profile=${profileName}`
-    ]);
-  } catch (err) {
-    // Retry une seule fois après reconnexion
-    console.warn('🔁 Retry création voucher...');
-    safeDisconnect();
-    await ensureMikrotik();
-
-    await mikrotik.write('/ip/hotspot/user/add', [
-      `=name=${username}`,
-      `=password=${password}`,
-      `=profile=${profileName}`
-    ]);
-  }
+  await mikrotik.write('/ip/hotspot/user/add', [
+    `=name=${username}`,
+    `=password=${password}`,
+    `=profile=${profileName}`
+  ]);
 
   console.log(`🎟️ Voucher créé: ${username}/${password}`);
   return { username, password };
